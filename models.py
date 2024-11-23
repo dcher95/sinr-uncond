@@ -6,6 +6,8 @@ def get_model(params):
 
     if params['model'] == 'ResidualFCNet':
         return ResidualFCNet(params['input_dim'], params['num_classes'], params['num_filts'], params['depth'])
+    elif params['model'] == 'ResidualFCNetUnconditional':
+        return ResidualFCNetUnconditional(params['input_dim'], params['num_filts'], params['depth'])
     elif params['model'] == 'LinNet':
         return LinNet(params['input_dim'], params['num_classes'])
     else:
@@ -29,6 +31,27 @@ class ResLayer(nn.Module):
         y = self.nonlin2(y)
         out = x + y
         return out
+
+class ResidualFCNetUnconditional(nn.Module):
+
+    def __init__(self, num_inputs, num_filts, depth=4):
+        super(ResidualFCNetUnconditional, self).__init__()
+        self.inc_bias = False
+        self.any_species_emb = nn.Linear(num_filts, 1, bias=self.inc_bias)  # Single output for any species presence. Name is same b/c it uses this name in loss.
+        
+        layers = []
+        layers.append(nn.Linear(num_inputs, num_filts))
+        layers.append(nn.ReLU(inplace=True))
+        for _ in range(depth):
+            layers.append(ResLayer(num_filts))
+        self.feats = nn.Sequential(*layers)
+
+    def forward(self, x, return_feats=False):
+        loc_emb = self.feats(x)
+        if return_feats:
+            return loc_emb
+        presence_pred = self.any_species_emb(loc_emb)  # Single probability output
+        return torch.sigmoid(presence_pred)
 
 class ResidualFCNet(nn.Module):
 

@@ -40,6 +40,35 @@ class LocationDataset(torch.utils.data.Dataset):
         class_id  = self.labels[index]
         return loc_feat, loc, class_id
 
+class LocationDatasetUnconditional(torch.utils.data.Dataset):
+    def __init__(self, locs, input_enc, device):
+        
+        # Handle input encoding:
+        self.input_enc = input_enc
+        if self.input_enc in ['env', 'sin_cos_env']:
+            raster = load_env()
+        else:
+            raster = None
+        self.enc = utils.CoordEncoder(input_enc, raster)
+
+        # Define some properties:
+        self.locs = locs
+        self.loc_feats = self.enc.encode(self.locs)
+
+        # Useful numbers:
+        self.input_dim = self.loc_feats.shape[1]
+
+        if self.enc.raster is not None:
+            self.enc.raster = self.enc.raster.to(device)
+
+    def __len__(self):
+        return self.loc_feats.shape[0]
+
+    def __getitem__(self, index):
+        loc_feat = self.loc_feats[index, :]
+        loc = self.locs[index, :]
+        return loc_feat, loc
+    
 def load_env():
     with open('paths.json', 'r') as f:
         paths = json.load(f)
@@ -189,6 +218,7 @@ def get_train_data(params):
 
     labels = torch.from_numpy(np.array(class_ids)[idx_ss])
 
-    ds = LocationDataset(locs, labels, classes, class_to_taxa, params['input_enc'], params['device'])
+    # ds = LocationDataset(locs, labels, classes, class_to_taxa, params['input_enc'], params['device'])
+    ds = LocationDatasetUnconditional(locs, params['input_enc'], params['device']) # Inefficient, but whatever.
 
     return ds

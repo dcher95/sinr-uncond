@@ -69,8 +69,8 @@ def launch_training_run(ovr):
     # data:
     train_dataset = datasets.get_train_data(params)
     params['input_dim'] = train_dataset.input_dim
-    params['num_classes'] = train_dataset.num_classes
-    params['class_to_taxa'] = train_dataset.class_to_taxa
+    # params['num_classes'] = train_dataset.num_classes # unconditional
+    # params['class_to_taxa'] = train_dataset.class_to_taxa # unconditional
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=params['batch_size'],

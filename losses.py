@@ -14,6 +14,8 @@ def get_loss_function(params):
         return an_slds_me
     elif params['loss'] == 'an_ssdl_me':
         return an_ssdl_me
+    elif params['loss'] == 'an_full_uncondititonal':
+        return an_full_unconditional
 
 def neg_log(x):
     return -torch.log(x + 1e-5)
@@ -132,6 +134,50 @@ def an_full(batch, model, params, loc_to_feats, neg_type='hard'):
     loss = loss_pos.mean() + loss_bg.mean()
     
     return loss
+
+def an_full_unconditional(batch, model, params, loc_to_feats, alpha = 0.95, neg_type='hard'):
+    
+    inds = torch.arange(params['batch_size'])
+
+    loc_feat, _ = batch  # Remove class_id from unpacking
+    loc_feat = loc_feat.to(params['device'])
+    
+    assert model.inc_bias == False
+    batch_size = loc_feat.shape[0]
+    
+    # create random background samples and extract features
+    rand_loc = utils.rand_samples(batch_size, params['device'], rand_type='spherical')
+    rand_feat = loc_to_feats(rand_loc, normalize=False)
+    
+    # get location embeddings
+    loc_cat = torch.cat((loc_feat, rand_feat), 0)  # stack vertically
+    loc_emb_cat = model(loc_cat, return_feats=True)
+    loc_emb = loc_emb_cat[:batch_size, :]
+    loc_emb_rand = loc_emb_cat[batch_size:, :]
+    
+    # get predictions for locations and background locations
+    loc_pred = torch.sigmoid(model.any_species_emb(loc_emb))
+    loc_pred_rand = torch.sigmoid(model.any_species_emb(loc_emb_rand))
+    
+    # data loss
+    if neg_type == 'hard':
+        loss_pos = neg_log(1.0 - loc_pred)  # assume negative
+        loss_bg = neg_log(1.0 - loc_pred_rand)  # assume negative
+    elif neg_type == 'entropy':
+        loss_pos = -1 * bernoulli_entropy(1.0 - loc_pred)  # entropy
+        loss_bg = -1 * bernoulli_entropy(1.0 - loc_pred_rand)  # entropy
+    else:
+        raise NotImplementedError
+
+    # Adjust the positive loss weight uniformly (species unconditional)
+    loss_pos = neg_log(loc_pred)
+
+    # total loss
+    # loss = loss_pos.mean() + loss_bg.mean()
+    loss = alpha * loss_pos.mean() + (1 - alpha) * loss_bg.mean()
+
+    return loss
+
 
 def an_full_me(batch, model, params, loc_to_feats):
 

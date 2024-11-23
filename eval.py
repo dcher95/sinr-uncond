@@ -16,6 +16,7 @@ from sklearn.preprocessing import MinMaxScaler
 import utils
 import models
 import datasets
+import adjustment
 
 class EvaluatorSNT:
     def __init__(self, train_params, eval_params):
@@ -49,7 +50,7 @@ class EvaluatorSNT:
         gt = np.array(gt).astype(np.float32)
         return obs_locs, gt
 
-    def run_evaluation(self, model, enc):
+    def run_evaluation(self, model, enc, uncond_model=None, alpha=1, low_observation_density_threshold=1):
         results = {}
 
         # set seeds:
@@ -74,7 +75,12 @@ class EvaluatorSNT:
         with torch.no_grad():
             loc_emb = model(loc_feat, return_feats=True)
             wt = model.class_emb.weight[classes_of_interest, :]
-            pred_mtx = torch.matmul(loc_emb, torch.transpose(wt, 0, 1)).cpu().numpy()
+            pred_mtx = torch.matmul(loc_emb, torch.transpose(wt, 0, 1)).cpu().numpy() # [loc, species]
+
+            # Extract the loc_emb using the unconditional model, and get predictions
+            if uncond_model is not None:
+                pred_mtx_uncond = uncond_model(loc_feat).cpu().numpy()
+
 
         split_rng = np.random.default_rng(self.eval_params['split_seed'])
         for tt_id, tt in enumerate(self.taxa):
@@ -101,8 +107,19 @@ class EvaluatorSNT:
                     cur_labels = cur_labels[idx_sel]
 
                 # extract model predictions for current taxa from prediction matrix
-                pred = pred_mtx[cur_loc_indices, tt_id]
+                pred = pred_mtx[cur_loc_indices, tt_id] 
 
+                ### Apply logit offset here!!
+                uncond_preds = pred_mtx_uncond[cur_loc_indices] if uncond_model is not None else None
+
+                if uncond_preds is not None:
+                    pred = adjustment.logit_offset(
+                        inputs=pred,
+                        densities=uncond_preds.squeeze(-1), # [loc, # densities] -> [loc] to match pred
+                        alpha=alpha,
+                        low_observation_density_threshold=low_observation_density_threshold
+                    )
+                    
                 # compute the AP for each taxa
                 results['per_species_average_precision_all'][tt_id] = utils.average_precision_score_faster((cur_labels > 0).astype(np.int32), pred)
 
@@ -132,7 +149,7 @@ class EvaluatorIUCN:
         self.obs_locs = np.array(self.data['locs'], dtype=np.float32)
         self.taxa = [int(tt) for tt in self.data['taxa_presence'].keys()]
 
-    def run_evaluation(self, model, enc):
+    def run_evaluation(self, model, enc, uncond_model=None, alpha=1, low_observation_density_threshold=1):
         results = {}
 
         results['per_species_average_precision_all'] = np.zeros(len(self.taxa), dtype=np.float32)
@@ -153,6 +170,10 @@ class EvaluatorIUCN:
             wt = model.class_emb.weight[classes_of_interest, :]
             pred_mtx = torch.matmul(loc_emb, torch.transpose(wt, 0, 1)).cpu().numpy()
 
+            # Extract the loc_emb using the unconditional model, and get predictions
+            if uncond_model is not None:
+                pred_mtx_uncond = uncond_model(loc_feat).cpu().numpy()
+
         for tt_id, tt in enumerate(self.taxa):
             class_of_interest = np.where(np.array(self.train_params['class_to_taxa']) == tt)[0]
 
@@ -162,6 +183,18 @@ class EvaluatorIUCN:
             else:
                 # extract model predictions for current taxa from prediction matrix
                 pred = pred_mtx[:, tt_id]
+
+                ### Apply logit offset here!!
+                uncond_preds = pred_mtx_uncond if uncond_model is not None else None
+
+                if uncond_preds is not None:
+                    pred = adjustment.logit_offset(
+                        inputs=pred,
+                        densities=uncond_preds.squeeze(-1), # [loc, # densities] -> [loc] to match pred
+                        alpha=alpha,
+                        low_observation_density_threshold=low_observation_density_threshold
+                    )
+
                 gt = np.zeros(obs_locs.shape[0], dtype=np.float32)
                 gt[self.data['taxa_presence'][str(tt)]] = 1.0
                 # average precision score:
@@ -223,7 +256,7 @@ class EvaluatorGeoPrior:
 
         return geo_pred, vision_pred
 
-    def run_evaluation(self, model, enc):
+    def run_evaluation(self, model, enc, uncond_model=None, alpha=1, low_observation_density_threshold=1):
         results = {}
 
         # loop over in batches
@@ -242,6 +275,18 @@ class EvaluatorGeoPrior:
 
             with torch.no_grad():
                 geo_pred = model(loc_feat).cpu().numpy()
+                print('geo_pred:', geo_pred.shape)
+                if uncond_model is not None:
+                    pred_uncond = uncond_model(loc_feat).cpu().numpy()
+                    print('pred_uncond:', pred_uncond.shape)
+
+                    geo_pred = adjustment.logit_offset(
+                        inputs=geo_pred,
+                        densities=pred_uncond.squeeze(-1), # [loc, # densities] -> [loc] to match pred
+                        alpha=alpha,
+                        low_observation_density_threshold=low_observation_density_threshold
+                    )
+                    print('geo_pred-off:', geo_pred.shape)
 
             geo_pred, vision_pred = self.convert_to_inat_vision_order(geo_pred, vision_probs, vision_inds,
                                                                  self.data['model_to_taxa'], self.taxon_map)
@@ -309,7 +354,7 @@ class EvaluatorGeoFeature:
             scaler = MinMaxScaler()
             feats_train_scaled = scaler.fit_transform(feats_train)
             feats_test_scaled = scaler.transform(feats_test)
-            clf = RidgeCV(alphas=(0.1, 1.0, 10.0), normalize=False, cv=10, fit_intercept=True, scoring='r2').fit(feats_train_scaled, labels_train)
+            clf = RidgeCV(alphas=(0.1, 1.0, 10.0), cv=10, fit_intercept=True, scoring='r2').fit(feats_train_scaled, labels_train)
             train_score = clf.score(feats_train_scaled, labels_train)
             test_score = clf.score(feats_test_scaled, labels_test)
             results[f'train_r2_{raster_name}'] = float(train_score)
@@ -335,6 +380,14 @@ def launch_eval_run(overrides):
     model = model.to(eval_params['device'])
     model.eval()
 
+    # load in unconditional model
+    eval_params['uncond_model_path'] = '/data/cher/sinr-uncond/experiments/unconditional/model.pt'
+    uncond_train_params = torch.load(eval_params['uncond_model_path'], map_location='cpu')
+    uncond_model = models.get_model(uncond_train_params['params'])
+    uncond_model.load_state_dict(uncond_train_params['state_dict'], strict=True)
+    uncond_model = uncond_model.to(eval_params['device'])
+    uncond_model.eval()
+
     # create input encoder:
     if train_params['params']['input_enc'] in ['env', 'sin_cos_env']:
         raster = datasets.load_env().to(eval_params['device'])
@@ -349,15 +402,15 @@ def launch_eval_run(overrides):
         eval_params['val_frac'] = 0.50
         eval_params['split_seed'] = 7499
         evaluator = EvaluatorSNT(train_params['params'], eval_params)
-        results = evaluator.run_evaluation(model, enc)
+        results = evaluator.run_evaluation(model, enc, uncond_model)
         evaluator.report(results)
     elif eval_params['eval_type'] == 'iucn':
         evaluator = EvaluatorIUCN(train_params['params'], eval_params)
-        results = evaluator.run_evaluation(model, enc)
+        results = evaluator.run_evaluation(model, enc, uncond_model)
         evaluator.report(results)
     elif eval_params['eval_type'] == 'geo_prior':
         evaluator = EvaluatorGeoPrior(train_params['params'], eval_params)
-        results = evaluator.run_evaluation(model, enc)
+        results = evaluator.run_evaluation(model, enc,  uncond_model)
         evaluator.report(results)
     elif eval_params['eval_type'] == 'geo_feature':
         evaluator = EvaluatorGeoFeature(train_params['params'], eval_params)
